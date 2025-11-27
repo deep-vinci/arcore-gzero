@@ -28,6 +28,7 @@ import com.google.ar.core.InstantPlacementPoint
 import com.google.ar.core.LightEstimate
 import com.google.ar.core.Plane
 import com.google.ar.core.Point
+import com.google.ar.core.Pose
 import com.google.ar.core.Session
 import com.google.ar.core.Trackable
 import com.google.ar.core.TrackingFailureReason
@@ -121,18 +122,67 @@ class HelloArRenderer(val activity: HelloArActivity) :
   val projectionMatrix = FloatArray(16)
   val modelViewMatrix = FloatArray(16) // view x model
 
+
+  // GPS Rendering Matrices — DO NOT reuse sample matrices
+  private val gpsProjectionMatrix = FloatArray(16)
+  private val gpsViewMatrix = FloatArray(16)
+  private val gpsViewProjectionMatrix = FloatArray(16)
+  private val gpsModelMatrix = FloatArray(16)
+  private val gpsModelViewProjectionMatrix = FloatArray(16)
+
   val modelViewProjectionMatrix = FloatArray(16) // projection x view x model
 
   val sphericalHarmonicsCoefficients = FloatArray(9 * 3)
   val viewInverseMatrix = FloatArray(16)
   val worldLightDirection = floatArrayOf(0.0f, 0.0f, 0.0f, 0.0f)
   val viewLightDirection = FloatArray(4) // view x world light direction
+  var lastTrackingState: String = "UNKNOWN"
+  var originPose: Pose? = null
 
   val session
     get() = activity.arCoreSessionHelper.session
 
   val displayRotationHelper = DisplayRotationHelper(activity)
   val trackingStateHelper = TrackingStateHelper(activity)
+
+  var latestGpsAnchorRequest: Pair<Float, Float>? = null
+  val anchors = mutableListOf<Anchor>()
+  fun add(anchor: Anchor) {
+    anchors.add(anchor)
+  }
+
+  fun drawAnchors(frame: Frame) {
+    if (!::virtualObjectShader.isInitialized) return
+    if (!::virtualObjectMesh.isInitialized) return
+    if (anchors.isEmpty()) return
+
+    for (anchor in anchors) {
+      if (anchor.trackingState != TrackingState.TRACKING) continue
+
+      anchor.pose.toMatrix(gpsModelMatrix, 0)
+
+      // Scale the GPS object correctly
+      val scale = 10.0f
+      Matrix.scaleM(gpsModelMatrix, 0, scale, scale, scale)
+
+      // Compute MVP
+      Matrix.multiplyMM(
+        gpsModelViewProjectionMatrix,
+        0,
+        gpsViewProjectionMatrix,
+        0,
+        gpsModelMatrix,
+        0
+      )
+
+      virtualObjectShader.setMat4("u_ModelViewProjection", gpsModelViewProjectionMatrix)
+      virtualObjectShader.setTexture("u_AlbedoTexture", virtualObjectAlbedoTexture)
+
+      render.draw(virtualObjectMesh, virtualObjectShader, virtualSceneFramebuffer)
+    }
+  }
+
+
 
   override fun onResume(owner: LifecycleOwner) {
     displayRotationHelper.onResume()
@@ -144,6 +194,7 @@ class HelloArRenderer(val activity: HelloArActivity) :
   }
 
   override fun onSurfaceCreated(render: SampleRender) {
+    this.render = render
     // Prepare the rendering objects.
     // This involves reading shaders and 3D model files, so may throw an IOException.
     try {
@@ -264,6 +315,7 @@ class HelloArRenderer(val activity: HelloArActivity) :
 
     // -- Update per-frame state
 
+
     // Notify ARCore session that the view size changed so that the perspective matrix and
     // the video background can be properly adjusted.
     displayRotationHelper.updateSessionIfNeeded(session)
@@ -281,6 +333,48 @@ class HelloArRenderer(val activity: HelloArActivity) :
       }
 
     val camera = frame.camera
+    lastTrackingState = camera.trackingState.toString()
+
+    camera.getProjectionMatrix(gpsProjectionMatrix, 0, 0.1f, 100f)
+    camera.getViewMatrix(gpsViewMatrix, 0)
+
+    Matrix.multiplyMM(
+      gpsViewProjectionMatrix,
+      0,
+      gpsProjectionMatrix,
+      0,
+      gpsViewMatrix,
+      0
+    )
+    if (camera.trackingState != TrackingState.TRACKING) {
+      latestGpsAnchorRequest = null
+    }
+
+    if (originPose == null && camera.trackingState == TrackingState.TRACKING) {
+      originPose = camera.pose.extractTranslation()
+    }
+
+// Handle pending GPS anchor creation
+    latestGpsAnchorRequest?.let { (x, z) ->
+
+      // We MUST have a stable origin pose before placing anchors
+      val worldOrigin = originPose ?: return@let
+
+      // Create a pose offset from the world origin, NOT camera
+      val targetLocalPose = Pose.makeTranslation(x, 0f, z)
+
+      // Convert local (x,z) offset into world AR coordinates
+      val finalPose = worldOrigin.compose(targetLocalPose)
+
+      // Finally create the anchor in stable world space
+      val anchor = session.createAnchor(finalPose)
+
+      anchors.add(anchor)
+
+      latestGpsAnchorRequest = null
+    }
+
+    // Render all anchors normally
 
     // Update BackgroundRenderer state to match the depth settings.
     try {
@@ -345,6 +439,20 @@ class HelloArRenderer(val activity: HelloArActivity) :
       backgroundRenderer.drawBackground(render)
     }
 
+    if (anchors.isEmpty() && originPose != null) {
+      // draw a test pawn 1 meter in front of camera
+      val testPose = camera.pose.compose(Pose.makeTranslation(0f, 0f, -1f))
+      val testMatrix = FloatArray(16)
+
+      testPose.toMatrix(testMatrix, 0)
+      Matrix.multiplyMM(testMatrix, 0, gpsViewProjectionMatrix, 0, testMatrix, 0)
+
+      virtualObjectShader.setMat4("u_ModelViewProjection", testMatrix)
+      virtualObjectShader.setTexture("u_AlbedoTexture", virtualObjectAlbedoTexture)
+
+      render.draw(virtualObjectMesh, virtualObjectShader, virtualSceneFramebuffer)
+    }
+
     // If not tracking, don't draw 3D objects.
     if (camera.trackingState == TrackingState.PAUSED) {
       return
@@ -374,6 +482,7 @@ class HelloArRenderer(val activity: HelloArActivity) :
       camera.displayOrientedPose,
       projectionMatrix
     )
+    drawAnchors( frame)
 
     // -- Draw occluded virtual objects
 
@@ -387,7 +496,8 @@ class HelloArRenderer(val activity: HelloArActivity) :
       // Get the current pose of an Anchor in world space. The Anchor pose is updated
       // during calls to session.update() as ARCore refines its estimate of the world.
       anchor.pose.toMatrix(modelMatrix, 0)
-
+      val scale = 5.0f   // increase to 10, 20, or 50 if needed
+      Matrix.scaleM(modelMatrix, 0, scale, scale, scale)
       // Calculate model/view/projection matrices
       Matrix.multiplyMM(modelViewMatrix, 0, viewMatrix, 0, modelMatrix, 0)
       Matrix.multiplyMM(modelViewProjectionMatrix, 0, projectionMatrix, 0, modelViewMatrix, 0)

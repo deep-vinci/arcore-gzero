@@ -48,13 +48,45 @@ class HelloArView(val activity: HelloArActivity) : DefaultLifecycleObserver {
         }
       }
     }
-
   val infoText = root.findViewById<TextView>(R.id.infoText)
-
   @SuppressLint("SetTextI18n")
-  fun updateInfo(lat: Double, lng: Double) {
-    infoText.text = lat.toString() + " " + lng.toString()
+  fun updateInfo(
+    lat: Double,
+    lng: Double,
+    targetLat: Double,
+    targetLng: Double,
+    distance: Float,
+    bearing: Double,
+    anchorX: Float?,
+    anchorY: Float?,
+    anchorZ: Float?,
+    tracking: String,
+    anchorCount: Int
+  ) {
+    infoText.text =
+      "Your GPS: $lat , $lng\n" +
+              "Target: $targetLat , $targetLng\n" +
+              "Distance(m): $distance\n" +
+              "Bearing: $bearing°\n" +
+              "Tracking: $tracking\n" +
+              "Anchors: $anchorCount\n" +
+              "Anchor XYZ(m): ${anchorX ?: "?"} , ${anchorY ?: "?"} , ${anchorZ ?: "?"}"
   }
+
+
+  private fun haversineDistance(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+    val R = 6371000.0 // meters
+    val dLat = Math.toRadians(lat2 - lat1)
+    val dLon = Math.toRadians(lon2 - lon1)
+    val a = kotlin.math.sin(dLat / 2) * kotlin.math.sin(dLat / 2) +
+            kotlin.math.cos(Math.toRadians(lat1)) *
+            kotlin.math.cos(Math.toRadians(lat2)) *
+            kotlin.math.sin(dLon / 2) *
+            kotlin.math.sin(dLon / 2)
+    val c = 2 * kotlin.math.atan2(kotlin.math.sqrt(a), kotlin.math.sqrt(1 - a))
+    return R * c
+  }
+
   val session
     get() = activity.arCoreSessionHelper.session
 

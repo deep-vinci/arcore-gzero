@@ -47,6 +47,8 @@ import com.google.android.gms.location.LocationResult
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.LocationRequest
 import com.google.android.gms.location.Priority
+import com.google.ar.core.Pose
+
 /**
  * This is a simple example that shows how to create an augmented reality (AR) application using the
  * ARCore API. The application will display any detected planes and will allow the user to tap on a
@@ -67,6 +69,26 @@ class HelloArActivity : AppCompatActivity() {
   lateinit var locationRequest: LocationRequest
   lateinit var locationCallback: LocationCallback
 
+  val lat2 = 22.294502 //22.292008
+  val lng2 = 73.359828 //73.363306
+  var hasPlacedTarget = false
+  var originLat: Double? = null
+  var originLng: Double? = null
+
+  private fun bearingToTarget(lat1: Double, lon1: Double, lat2: Double, lon2: Double): Double {
+    val lat1Rad = Math.toRadians(lat1)
+    val lat2Rad = Math.toRadians(lat2)
+    val dLon = Math.toRadians(lon2 - lon1)
+
+    val y = kotlin.math.sin(dLon) * kotlin.math.cos(lat2Rad)
+    val x = kotlin.math.cos(lat1Rad) * kotlin.math.sin(lat2Rad) -
+            kotlin.math.sin(lat1Rad) * kotlin.math.cos(lat2Rad) * kotlin.math.cos(dLon)
+
+    var angle = Math.toDegrees(kotlin.math.atan2(y, x))
+
+    if (angle < 0) angle += 360.0
+    return angle
+  }
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
@@ -88,12 +110,75 @@ class HelloArActivity : AppCompatActivity() {
     locationCallback = object : LocationCallback() {
       override fun onLocationResult(result: LocationResult) {
         val location = result.lastLocation ?: return
-        val lat = location.latitude
-        val lng = location.longitude
 
-        // Update the AR overlay
-        view.updateInfo(lat, lng)
-      }
+        val lat1 = location.latitude
+        val lng1 = location.longitude
+
+// Compute distance (in meters)
+        val result = FloatArray(1)
+        android.location.Location.distanceBetween(lat1, lng1, lat2, lng2, result)
+        val distance = result[0]
+
+// Compute bearing
+        val bearing = bearingToTarget(lat1, lng1, lat2, lng2)
+
+// Get anchor world position if exists
+        val anchor = renderer.anchors.firstOrNull()
+        val anchorMatrix = FloatArray(16)
+        var ax: Float? = null
+        var ay: Float? = null
+        var az: Float? = null
+        if (anchor != null) {
+          anchor.pose.toMatrix(anchorMatrix, 0)
+          ax = anchorMatrix[12]
+          ay = anchorMatrix[13]
+          az = anchorMatrix[14]
+        }
+
+// Tracking state (from last frame)
+        val trackingState = renderer.lastTrackingState
+
+// Update debug info on screen
+        view.updateInfo(
+          lat1,
+          lng1,
+          lat2,
+          lng2,
+          distance,
+          bearing,
+          ax,
+          ay,
+          az,
+          trackingState,
+          renderer.anchors.size
+        )
+
+// Now place anchor at target (not at your location)
+        placeGpsAnchor(lat2, lng2)
+        // Initialize origin first time only
+        if (originLat == null) {
+          originLat = lat1
+          originLng = lng1
+        }
+
+        // Now place anchor at TARGET position
+
+        // Place only once, and only after origin is set
+        if (!hasPlacedTarget && originLat != null) {
+
+          // Convert target to meters
+          val (x, z) = convertLatLngToMeters(lat2, lng2)
+          val distance = Math.sqrt((x * x + z * z).toDouble())
+
+          // Skip if anchor would be inside the camera
+          if (distance > 1.0) {
+            placeGpsAnchor(lat2, lng2)
+            hasPlacedTarget = true
+            Log.d("GPS-ANCHOR", "Placed target anchor: $distance meters away")
+          } else {
+            Log.w("GPS-ANCHOR", "Skipping anchor — target too close: $distance meters")
+          }
+        }      }
     }
     // Setup ARCore session lifecycle helper and configuration.
     arCoreSessionHelper = ARCoreSessionLifecycleHelper(this)
@@ -132,6 +217,8 @@ class HelloArActivity : AppCompatActivity() {
     SampleRender(view.surfaceView, renderer, assets)
 
     depthSettings.onCreate(this)
+    depthSettings.setUseDepthForOcclusion(false)
+
     instantPlacementSettings.onCreate(this)
   }
 
@@ -203,6 +290,7 @@ class HelloArActivity : AppCompatActivity() {
         }
       }
   }
+
   override fun onResume() {
     super.onResume()
     if (ActivityCompat.checkSelfPermission(
@@ -222,5 +310,35 @@ class HelloArActivity : AppCompatActivity() {
   override fun onPause() {
     super.onPause()
     fusedLocationClient.removeLocationUpdates(locationCallback)
+  }
+  fun convertLatLngToMeters(lat: Double, lng: Double): Pair<Float, Float> {
+    val lat0 = originLat ?: return Pair(0f, 0f)
+    val lng0 = originLng ?: return Pair(0f, 0f)
+
+    val earthRadius = 6378137.0
+
+    val dLat = Math.toRadians(lat - lat0)
+    val dLng = Math.toRadians(lng - lng0)
+
+    val x = (dLng * earthRadius * kotlin.math.cos(Math.toRadians(lat0))).toFloat()
+    val z = (dLat * earthRadius).toFloat()
+
+    // ARCore: +X = right, -Z = forward
+    return Pair(x, -z)
+  }
+
+  fun placeGpsAnchor(lat: Double, lng: Double) {
+    if (renderer.anchors.isNotEmpty()) return
+    val (x, z) = convertLatLngToMeters(lat, lng)
+
+    val distance = Math.sqrt((x * x + z * z).toDouble())
+
+    // Avoid placing anchor inside camera
+    if (distance < 1.0) {
+      Log.w("GPS-ANCHOR", "Anchor too close ($distance m) — skipping")
+      return
+    }
+
+    renderer.latestGpsAnchorRequest = Pair(x, z)
   }
 }
